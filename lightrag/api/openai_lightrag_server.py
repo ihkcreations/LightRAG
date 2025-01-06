@@ -1,9 +1,10 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from pydantic import BaseModel
+import asyncio
 import logging
 import argparse
 from lightrag import LightRAG, QueryParam
-from lightrag.llm import ollama_model_complete, ollama_embed
+from lightrag.llm import openai_complete_if_cache, openai_embedding
 from lightrag.utils import EmbeddingFunc
 from typing import Optional, List
 from enum import Enum
@@ -11,11 +12,23 @@ from pathlib import Path
 import shutil
 import aiofiles
 from ascii_colors import trace_exception
+import nest_asyncio
+
+import os
+
+from fastapi import Depends, Security
+from fastapi.security import APIKeyHeader
+from fastapi.middleware.cors import CORSMiddleware
+
+from starlette.status import HTTP_403_FORBIDDEN
+
+# Apply nest_asyncio to solve event loop issues
+nest_asyncio.apply()
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="LightRAG FastAPI Server with separate working and input directories"
+        description="LightRAG FastAPI Server with OpenAI integration"
     )
 
     # Server configuration
@@ -40,36 +53,20 @@ def parse_args():
 
     # Model configuration
     parser.add_argument(
-        "--model",
-        default="mistral-nemo:latest",
-        help="LLM model name (default: mistral-nemo:latest)",
+        "--model", default="gpt-4", help="OpenAI model name (default: gpt-4)"
     )
     parser.add_argument(
         "--embedding-model",
-        default="bge-m3:latest",
-        help="Embedding model name (default: bge-m3:latest)",
-    )
-    parser.add_argument(
-        "--ollama-host",
-        default="http://localhost:11434",
-        help="Ollama host URL (default: http://localhost:11434)",
+        default="text-embedding-3-large",
+        help="OpenAI embedding model (default: text-embedding-3-large)",
     )
 
     # RAG configuration
-    parser.add_argument(
-        "--max-async", type=int, default=4, help="Maximum async operations (default: 4)"
-    )
     parser.add_argument(
         "--max-tokens",
         type=int,
         default=32768,
         help="Maximum token size (default: 32768)",
-    )
-    parser.add_argument(
-        "--embedding-dim",
-        type=int,
-        default=1024,
-        help="Embedding dimensions (default: 1024)",
     )
     parser.add_argument(
         "--max-embed-tokens",
@@ -84,6 +81,13 @@ def parse_args():
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Logging level (default: INFO)",
+    )
+
+    parser.add_argument(
+        "--key",
+        type=str,
+        help="API key for authentication. This protects lightrag server against unauthorized access",
+        default=None,
     )
 
     return parser.parse_args()
@@ -130,6 +134,7 @@ class QueryRequest(BaseModel):
     query: str
     mode: SearchMode = SearchMode.hybrid
     stream: bool = False
+    only_need_context: bool = False
 
 
 class QueryResponse(BaseModel):
@@ -147,16 +152,77 @@ class InsertResponse(BaseModel):
     document_count: int
 
 
+def get_api_key_dependency(api_key: Optional[str]):
+    if not api_key:
+        # If no API key is configured, return a dummy dependency that always succeeds
+        async def no_auth():
+            return None
+
+        return no_auth
+
+    # If API key is configured, use proper authentication
+    api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+    async def api_key_auth(api_key_header_value: str | None = Security(api_key_header)):
+        if not api_key_header_value:
+            raise HTTPException(
+                status_code=HTTP_403_FORBIDDEN, detail="API Key required"
+            )
+        if api_key_header_value != api_key:
+            raise HTTPException(
+                status_code=HTTP_403_FORBIDDEN, detail="Invalid API Key"
+            )
+        return api_key_header_value
+
+    return api_key_auth
+
+
+async def get_embedding_dim(embedding_model: str) -> int:
+    """Get embedding dimensions for the specified model"""
+    test_text = ["This is a test sentence."]
+    embedding = await openai_embedding(test_text, model=embedding_model)
+    return embedding.shape[1]
+
+
 def create_app(args):
     # Setup logging
     logging.basicConfig(
         format="%(levelname)s:%(message)s", level=getattr(logging, args.log_level)
     )
 
-    # Initialize FastAPI app
+    # Check if API key is provided either through env var or args
+    api_key = os.getenv("LIGHTRAG_API_KEY") or args.key
+
+    # Initialize FastAPI
     app = FastAPI(
         title="LightRAG API",
-        description="API for querying text using LightRAG with separate storage and input directories",
+        description="API for querying text using LightRAG with separate storage and input directories"
+        + "(With authentication)"
+        if api_key
+        else "",
+        version="1.0.0",
+        openapi_tags=[{"name": "api"}],
+    )
+
+    # Add CORS middleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Create the optional API key dependency
+    optional_api_key = get_api_key_dependency(api_key)
+
+    # Add CORS middleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
     # Create working directory if it doesn't exist
@@ -165,23 +231,31 @@ def create_app(args):
     # Initialize document manager
     doc_manager = DocumentManager(args.input_dir)
 
-    # Initialize RAG
+    # Get embedding dimensions
+    embedding_dim = asyncio.run(get_embedding_dim(args.embedding_model))
+
+    async def async_openai_complete(
+        prompt, system_prompt=None, history_messages=[], **kwargs
+    ):
+        """Async wrapper for OpenAI completion"""
+        return await openai_complete_if_cache(
+            args.model,
+            prompt,
+            system_prompt=system_prompt,
+            history_messages=history_messages,
+            **kwargs,
+        )
+
+    # Initialize RAG with OpenAI configuration
     rag = LightRAG(
         working_dir=args.working_dir,
-        llm_model_func=ollama_model_complete,
+        llm_model_func=async_openai_complete,
         llm_model_name=args.model,
-        llm_model_max_async=args.max_async,
         llm_model_max_token_size=args.max_tokens,
-        llm_model_kwargs={
-            "host": args.ollama_host,
-            "options": {"num_ctx": args.max_tokens},
-        },
         embedding_func=EmbeddingFunc(
-            embedding_dim=args.embedding_dim,
+            embedding_dim=embedding_dim,
             max_token_size=args.max_embed_tokens,
-            func=lambda texts: ollama_embed(
-                texts, embed_model=args.embedding_model, host=args.ollama_host
-            ),
+            func=lambda texts: openai_embedding(texts, model=args.embedding_model),
         ),
     )
 
@@ -208,7 +282,7 @@ def create_app(args):
         except Exception as e:
             logging.error(f"Error during startup indexing: {str(e)}")
 
-    @app.post("/documents/scan")
+    @app.post("/documents/scan", dependencies=[Depends(optional_api_key)])
     async def scan_for_new_documents():
         """Manually trigger scanning for new documents"""
         try:
@@ -233,7 +307,7 @@ def create_app(args):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-    @app.post("/documents/upload")
+    @app.post("/documents/upload", dependencies=[Depends(optional_api_key)])
     async def upload_to_input_dir(file: UploadFile = File(...)):
         """Upload a file to the input directory"""
         try:
@@ -261,12 +335,18 @@ def create_app(args):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-    @app.post("/query", response_model=QueryResponse)
+    @app.post(
+        "/query", response_model=QueryResponse, dependencies=[Depends(optional_api_key)]
+    )
     async def query_text(request: QueryRequest):
         try:
             response = await rag.aquery(
                 request.query,
-                param=QueryParam(mode=request.mode, stream=request.stream),
+                param=QueryParam(
+                    mode=request.mode,
+                    stream=request.stream,
+                    only_need_context=request.only_need_context,
+                ),
             )
 
             if request.stream:
@@ -279,11 +359,16 @@ def create_app(args):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-    @app.post("/query/stream")
+    @app.post("/query/stream", dependencies=[Depends(optional_api_key)])
     async def query_text_stream(request: QueryRequest):
         try:
             response = rag.query(
-                request.query, param=QueryParam(mode=request.mode, stream=True)
+                request.query,
+                param=QueryParam(
+                    mode=request.mode,
+                    stream=True,
+                    only_need_context=request.only_need_context,
+                ),
             )
 
             async def stream_generator():
@@ -294,7 +379,11 @@ def create_app(args):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-    @app.post("/documents/text", response_model=InsertResponse)
+    @app.post(
+        "/documents/text",
+        response_model=InsertResponse,
+        dependencies=[Depends(optional_api_key)],
+    )
     async def insert_text(request: InsertTextRequest):
         try:
             rag.insert(request.text)
@@ -306,7 +395,11 @@ def create_app(args):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-    @app.post("/documents/file", response_model=InsertResponse)
+    @app.post(
+        "/documents/file",
+        response_model=InsertResponse,
+        dependencies=[Depends(optional_api_key)],
+    )
     async def insert_file(file: UploadFile = File(...), description: str = Form(None)):
         try:
             content = await file.read()
@@ -323,14 +416,18 @@ def create_app(args):
             return InsertResponse(
                 status="success",
                 message=f"File '{file.filename}' successfully inserted",
-                document_count=len(rag),
+                document_count=1,
             )
         except UnicodeDecodeError:
             raise HTTPException(status_code=400, detail="File encoding not supported")
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-    @app.post("/documents/batch", response_model=InsertResponse)
+    @app.post(
+        "/documents/batch",
+        response_model=InsertResponse,
+        dependencies=[Depends(optional_api_key)],
+    )
     async def insert_batch(files: List[UploadFile] = File(...)):
         try:
             inserted_count = 0
@@ -355,12 +452,16 @@ def create_app(args):
             return InsertResponse(
                 status="success" if inserted_count > 0 else "partial_success",
                 message=status_message,
-                document_count=len(rag),
+                document_count=len(files),
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-    @app.delete("/documents", response_model=InsertResponse)
+    @app.delete(
+        "/documents",
+        response_model=InsertResponse,
+        dependencies=[Depends(optional_api_key)],
+    )
     async def clear_documents():
         try:
             rag.text_chunks = []
@@ -374,7 +475,7 @@ def create_app(args):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-    @app.get("/health")
+    @app.get("/health", dependencies=[Depends(optional_api_key)])
     async def get_status():
         """Get current system status"""
         return {
@@ -386,16 +487,20 @@ def create_app(args):
                 "model": args.model,
                 "embedding_model": args.embedding_model,
                 "max_tokens": args.max_tokens,
-                "ollama_host": args.ollama_host,
+                "embedding_dim": embedding_dim,
             },
         }
 
     return app
 
 
-if __name__ == "__main__":
+def main():
     args = parse_args()
     import uvicorn
 
     app = create_app(args)
     uvicorn.run(app, host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()
