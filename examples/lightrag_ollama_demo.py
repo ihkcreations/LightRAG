@@ -58,7 +58,7 @@ def main():
     # with open("./book.txt", "r", encoding="utf-8") as f:
     #     rag.insert(f.read())
 
-    file_path = 'book_ollama/output.csv'
+    file_path = 'book_ollama/merged_dataset.csv'
     text_content = textract.process(file_path)
 
     rag.insert(text_content.decode('utf-8'))
