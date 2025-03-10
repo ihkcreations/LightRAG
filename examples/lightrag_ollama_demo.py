@@ -23,7 +23,7 @@ async def initialize_rag():
     rag = LightRAG(
         working_dir=WORKING_DIR,
         llm_model_func=ollama_model_complete,
-        llm_model_name="gemma2:2b",
+        llm_model_name="deepseek-r1:8b",
         llm_model_max_async=4,
         llm_model_max_token_size=32768,
         llm_model_kwargs={
@@ -55,35 +55,40 @@ def main():
     rag = asyncio.run(initialize_rag())
 
     # Insert example text
-    with open("./book.txt", "r", encoding="utf-8") as f:
-        rag.insert(f.read())
+    # with open("./book.txt", "r", encoding="utf-8") as f:
+    #     rag.insert(f.read())
+
+    file_path = 'book_ollama/output.csv'
+    text_content = textract.process(file_path)
+
+    rag.insert(text_content.decode('utf-8'))
 
     # Test different query modes
     print("\nNaive Search:")
     print(
         rag.query(
-            "What are the top themes in this story?", param=QueryParam(mode="naive")
+            "What do you understand from this document on the perspective of OBE?", param=QueryParam(mode="naive")
         )
     )
 
     print("\nLocal Search:")
     print(
         rag.query(
-            "What are the top themes in this story?", param=QueryParam(mode="local")
+            "Show the mappings of which CO maps to PO", param=QueryParam(mode="local")
         )
     )
 
     print("\nGlobal Search:")
     print(
         rag.query(
-            "What are the top themes in this story?", param=QueryParam(mode="global")
+            "What is the course code of the document? Show the mappings of which CO maps to PO.", param=QueryParam(mode="global")
         )
     )
 
     print("\nHybrid Search:")
     print(
         rag.query(
-            "What are the top themes in this story?", param=QueryParam(mode="hybrid")
+            "What is this document about?", param=QueryParam(mode="hybrid")
         )
     )
 
